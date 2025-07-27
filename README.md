@@ -56,14 +56,19 @@ zig build run
 zig build test
 ```
 
+## Architecture
+
+The project will use a centralized HTTP API server approach. See [`docs/http-api-design.md`](docs/http-api-design.md) for detailed design documentation.
+
 ## Planned Features
 
 - [ ] SQLite schema for issues, projects, and dependencies
-- [ ] CLI commands for issue CRUD operations
+- [ ] RESTful HTTP API server for centralized issue tracking
 - [ ] Dependency tracking and resolution
 - [ ] Import/export from markdown format
-- [ ] HTTP API for external integrations
+- [ ] API authentication and project management
 - [ ] Query interface for complex searches
+- [ ] Client libraries for Zig projects
 
 ## License
 
