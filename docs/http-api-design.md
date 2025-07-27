@@ -4,6 +4,16 @@
 
 This document outlines the design for a centralized HTTP API server approach for the Zig Issue Tracker. This approach provides a single, shared issue tracking service that multiple projects can connect to, enabling cross-project visibility and team collaboration.
 
+### HTTP Server Framework
+
+The server will be built using **httpz**, a lightweight and performant HTTP server library for Zig. httpz provides:
+- Simple and intuitive API for building web services
+- Built-in JSON response handling
+- Efficient memory management with request arenas
+- Path parameter and query string parsing
+- Middleware and error handler support
+- Native Zig implementation with zero dependencies
+
 ## Architecture
 
 ### Core Components
@@ -14,7 +24,7 @@ This document outlines the design for a centralized HTTP API server approach for
 ├─────────────────┤                     │                 │
 │   Zig Project B │ ◄─────────────────► │  Issue Tracker  │
 ├─────────────────┤                     │   API Server    │
-│     CI/CD       │ ◄─────────────────► │                 │
+│     CI/CD       │ ◄─────────────────► │    (httpz)      │
 ├─────────────────┤                     │                 │
 │   Web Browser   │ ◄─────────────────► │                 │
 └─────────────────┘                     └────────┬────────┘
@@ -24,6 +34,13 @@ This document outlines the design for a centralized HTTP API server approach for
                                         │   (issues.db)    │
                                         └─────────────────┘
 ```
+
+### Technology Stack
+
+- **Language**: Zig
+- **HTTP Server**: httpz
+- **Database**: SQLite (via zqlite)
+- **Serialization**: std.json
 
 ### Key Design Principles
 
@@ -261,6 +278,300 @@ Response:
 - Project-level permissions
 - Role-based access control (RBAC)
 
+## Server Implementation
+
+### Basic Server Setup
+
+```zig
+const std = @import("std");
+const httpz = @import("httpz");
+const database = @import("database.zig");
+
+const AppState = struct {
+    db_pool: *database.Pool,
+    api_keys: std.StringHashMap(bool),
+    start_time: i64,
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Initialize database pool
+    const db_pool = try database.Pool.init(allocator, .{
+        .path = "./issues.db",
+        .min_connections = 5,
+        .max_connections = 20,
+    });
+    defer db_pool.deinit();
+
+    // Initialize app state
+    var app_state = AppState{
+        .db_pool = db_pool,
+        .api_keys = std.StringHashMap(bool).init(allocator),
+        .start_time = std.time.timestamp(),
+    };
+    defer app_state.api_keys.deinit();
+
+    // Create server
+    var server = try httpz.Server(AppState).init(allocator, .{
+        .port = 8080,
+        .address = "0.0.0.0",
+        .request_timeout = 30000,      // 30 seconds
+        .keepalive_timeout = 120000,   // 2 minutes
+        .max_request_size = 1048576,   // 1MB
+    }, app_state);
+    defer server.deinit();
+
+    // Set up routes
+    var router = try server.router(.{
+        .not_found_handler = notFoundHandler,
+        .uncaught_error_handler = errorHandler,
+    });
+    
+    // Project routes
+    router.get("/api/v1/projects", handlers.getProjects, .{});
+    router.get("/api/v1/projects/:id", handlers.getProject, .{});
+    router.post("/api/v1/projects", handlers.createProject, .{});
+    router.put("/api/v1/projects/:id", handlers.updateProject, .{});
+    router.delete("/api/v1/projects/:id", handlers.deleteProject, .{});
+    
+    // Issue routes
+    router.get("/api/v1/issues", handlers.getIssues, .{});
+    router.get("/api/v1/issues/:id", handlers.getIssue, .{});
+    router.post("/api/v1/projects/:pid/issues", handlers.createIssue, .{});
+    router.put("/api/v1/issues/:id", handlers.updateIssue, .{});
+    router.delete("/api/v1/issues/:id", handlers.deleteIssue, .{});
+    
+    // Special endpoints
+    router.get("/api/v1/issues/ready", handlers.getReadyIssues, .{});
+    router.get("/api/v1/issues/blocked", handlers.getBlockedIssues, .{});
+    
+    std.log.info("Issue Tracker API Server starting on port 8080", .{});
+    try server.listen();
+}
+
+fn notFoundHandler(_: *httpz.Request, res: *httpz.Response, _: AppState) !void {
+    try res.json(.{ 
+        .@"error" = "Endpoint not found",
+        .message = "The requested resource does not exist"
+    }, .{ .status = 404 });
+}
+
+fn errorHandler(req: *httpz.Request, res: *httpz.Response, err: anyerror, _: AppState) void {
+    std.log.err("Uncaught error on {s}: {any}", .{ req.url.path, err });
+    
+    res.status = 500;
+    res.json(.{ 
+        .@"error" = "Internal server error",
+        .message = "An unexpected error occurred",
+        .timestamp = std.time.timestamp(),
+    }, .{}) catch {};
+}
+```
+
+### Handler Implementation Examples
+
+```zig
+const handlers = struct {
+    // GET /api/v1/issues/:id
+    pub fn getIssue(req: *httpz.Request, res: *httpz.Response, app_state: AppState) !void {
+        // Extract and validate issue ID
+        const issue_id_str = req.param("id") orelse {
+            try res.json(.{ .@"error" = "Issue ID required" }, .{ .status = 400 });
+            return;
+        };
+        
+        const issue_id = std.fmt.parseInt(u32, issue_id_str, 10) catch {
+            try res.json(.{ .@"error" = "Invalid issue ID format" }, .{ .status = 400 });
+            return;
+        };
+        
+        // Get database connection
+        var conn = app_state.db_pool.acquire() catch {
+            try res.json(.{ .@"error" = "Service temporarily unavailable" }, .{ .status = 503 });
+            return;
+        };
+        defer app_state.db_pool.release(conn);
+        
+        // Query issue
+        const issue = conn.getIssue(issue_id) catch |err| switch (err) {
+            error.NotFound => {
+                try res.json(.{ .@"error" = "Issue not found" }, .{ .status = 404 });
+                return;
+            },
+            else => {
+                std.log.err("Database error: {any}", .{err});
+                try res.json(.{ .@"error" = "Database error" }, .{ .status = 500 });
+                return;
+            },
+        };
+        
+        // Return issue with HATEOAS links
+        try res.json(.{
+            .id = issue.id,
+            .project_id = issue.project_id,
+            .issue_number = issue.issue_number,
+            .title = issue.title,
+            .description = issue.description,
+            .status = issue.status,
+            .priority = issue.priority,
+            .created_at = issue.created_at,
+            .updated_at = issue.updated_at,
+            ._links = .{
+                .self = try std.fmt.allocPrint(req.arena, "/api/v1/issues/{d}", .{issue.id}),
+                .project = try std.fmt.allocPrint(req.arena, "/api/v1/projects/{d}", .{issue.project_id}),
+                .comments = try std.fmt.allocPrint(req.arena, "/api/v1/issues/{d}/comments", .{issue.id}),
+            },
+        }, .{});
+    }
+    
+    // POST /api/v1/projects/:pid/issues
+    pub fn createIssue(req: *httpz.Request, res: *httpz.Response, app_state: AppState) !void {
+        // Validate project ID
+        const project_id_str = req.param("pid") orelse {
+            try res.json(.{ .@"error" = "Project ID required" }, .{ .status = 400 });
+            return;
+        };
+        
+        const project_id = std.fmt.parseInt(u32, project_id_str, 10) catch {
+            try res.json(.{ .@"error" = "Invalid project ID format" }, .{ .status = 400 });
+            return;
+        };
+        
+        // Parse request body
+        const body = req.body() orelse {
+            try res.json(.{ .@"error" = "Request body required" }, .{ .status = 400 });
+            return;
+        };
+        
+        const IssueInput = struct {
+            title: []const u8,
+            description: ?[]const u8 = null,
+            priority: ?[]const u8 = "medium",
+            assigned_to: ?[]const u8 = null,
+            tags: ?[][]const u8 = null,
+        };
+        
+        const input = std.json.parseFromSlice(IssueInput, req.arena, body, .{}) catch {
+            try res.json(.{ .@"error" = "Invalid JSON format" }, .{ .status = 400 });
+            return;
+        };
+        defer input.deinit();
+        
+        // Validate input
+        if (input.value.title.len == 0) {
+            try res.json(.{ .@"error" = "Title is required" }, .{ .status = 400 });
+            return;
+        }
+        
+        // Create issue in database
+        var conn = app_state.db_pool.acquire() catch {
+            try res.json(.{ .@"error" = "Service temporarily unavailable" }, .{ .status = 503 });
+            return;
+        };
+        defer app_state.db_pool.release(conn);
+        
+        const issue_id = conn.createIssue(.{
+            .project_id = project_id,
+            .title = input.value.title,
+            .description = input.value.description,
+            .priority = input.value.priority orelse "medium",
+            .assigned_to = input.value.assigned_to,
+        }) catch |err| {
+            std.log.err("Failed to create issue: {any}", .{err});
+            try res.json(.{ .@"error" = "Failed to create issue" }, .{ .status = 500 });
+            return;
+        };
+        
+        // Return created issue
+        res.status = 201;
+        try res.json(.{
+            .id = issue_id,
+            .message = "Issue created successfully",
+            ._links = .{
+                .self = try std.fmt.allocPrint(req.arena, "/api/v1/issues/{d}", .{issue_id}),
+            },
+        }, .{});
+    }
+    
+    // GET /api/v1/issues/ready
+    pub fn getReadyIssues(req: *httpz.Request, res: *httpz.Response, app_state: AppState) !void {
+        // Parse query parameters
+        const project = req.query("project");
+        const priority = req.query("priority");
+        const limit = blk: {
+            const limit_str = req.query("limit") orelse "20";
+            break :blk std.fmt.parseInt(u32, limit_str, 10) catch 20;
+        };
+        
+        // Validate limit
+        if (limit > 100) {
+            try res.json(.{ .@"error" = "Limit cannot exceed 100" }, .{ .status = 400 });
+            return;
+        }
+        
+        // Query ready issues (no blocking dependencies)
+        var conn = app_state.db_pool.acquire() catch {
+            try res.json(.{ .@"error" = "Service temporarily unavailable" }, .{ .status = 503 });
+            return;
+        };
+        defer app_state.db_pool.release(conn);
+        
+        const issues = conn.getReadyIssues(.{
+            .project_name = project,
+            .priority = priority,
+            .limit = limit,
+        }) catch |err| {
+            std.log.err("Failed to get ready issues: {any}", .{err});
+            try res.json(.{ .@"error" = "Failed to retrieve issues" }, .{ .status = 500 });
+            return;
+        };
+        
+        // Format response
+        try res.json(.{
+            .issues = issues,
+            .total = issues.len,
+            ._links = .{
+                .self = req.url.raw,
+            },
+        }, .{});
+    }
+};
+```
+
+### Authentication Middleware
+
+```zig
+fn authenticateRequest(req: *httpz.Request, res: *httpz.Response, app_state: AppState) !bool {
+    const auth_header = req.header("authorization") orelse {
+        try res.json(.{ .@"error" = "Authentication required" }, .{ .status = 401 });
+        return false;
+    };
+    
+    if (!std.mem.startsWith(u8, auth_header, "Bearer ")) {
+        try res.json(.{ .@"error" = "Invalid authorization format" }, .{ .status = 401 });
+        return false;
+    }
+    
+    const api_key = auth_header[7..];
+    if (!app_state.api_keys.contains(api_key)) {
+        try res.json(.{ .@"error" = "Invalid API key" }, .{ .status = 401 });
+        return false;
+    }
+    
+    return true;
+}
+
+// Use in handlers
+pub fn protectedHandler(req: *httpz.Request, res: *httpz.Response, app_state: AppState) !void {
+    if (!try authenticateRequest(req, res, app_state)) return;
+    
+    // Handler implementation...
+}
+```
+
 ## Integration Patterns
 
 ### 1. Zig Client Library
@@ -336,7 +647,66 @@ curl -X POST $ISSUE_TRACKER_URL/api/v1/projects/1/issues \
 
 ### 1. Local Development
 ```bash
-zig build run -- serve --port 8080 --db ./issues.db
+zig build run
+# Or with custom options
+zig build run -- --port 8080 --db ./issues.db
+```
+
+### build.zig Configuration
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    
+    // Add httpz dependency
+    const httpz = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Add zqlite dependency for SQLite
+    const zqlite = b.dependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    const exe = b.addExecutable(.{
+        .name = "zig-issue-tracker",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Add modules
+    exe.root_module.addImport("httpz", httpz.module("httpz"));
+    exe.root_module.addImport("zqlite", zqlite.module("zqlite"));
+    
+    // Link SQLite
+    exe.linkSystemLibrary("sqlite3");
+    exe.linkLibC();
+    
+    b.installArtifact(exe);
+}
+```
+
+### build.zig.zon Dependencies
+```zig
+.{
+    .name = "zig-issue-tracker",
+    .version = "0.1.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "https://github.com/karlseguin/http.zig/archive/[commit].tar.gz",
+            .hash = "[hash]",
+        },
+        .zqlite = .{
+            .url = "https://github.com/karlseguin/zqlite/archive/[commit].tar.gz", 
+            .hash = "[hash]",
+        },
+    },
+}
 ```
 
 ### 2. Docker Container
@@ -364,15 +734,103 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+## Advanced httpz Features
+
+### CORS Support
+
+```zig
+fn setupCORS(router: *httpz.Router(AppState)) void {
+    // Handle preflight requests
+    router.options("/*", corsHandler, .{});
+    
+    // Apply CORS to all routes
+    router.all("/*", addCORSHeaders, .{});
+}
+
+fn corsHandler(req: *httpz.Request, res: *httpz.Response, _: AppState) !void {
+    res.headers.add("Access-Control-Allow-Origin", "*");
+    res.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.headers.add("Access-Control-Max-Age", "86400");
+    res.status = 204;
+}
+
+fn addCORSHeaders(req: *httpz.Request, res: *httpz.Response, _: AppState) !void {
+    res.headers.add("Access-Control-Allow-Origin", "*");
+}
+```
+
+### Request Validation Helpers
+
+```zig
+const validation = struct {
+    pub fn requireParam(req: *httpz.Request, res: *httpz.Response, name: []const u8) ?[]const u8 {
+        const value = req.param(name) orelse {
+            res.json(.{ .@"error" = std.fmt.allocPrint(req.arena, "{s} is required", .{name}) catch "Parameter required" }, .{ .status = 400 }) catch {};
+            return null;
+        };
+        return value;
+    }
+    
+    pub fn parseIntParam(req: *httpz.Request, res: *httpz.Response, name: []const u8) ?u32 {
+        const str = requireParam(req, res, name) orelse return null;
+        return std.fmt.parseInt(u32, str, 10) catch {
+            res.json(.{ .@"error" = std.fmt.allocPrint(req.arena, "Invalid {s} format", .{name}) catch "Invalid format" }, .{ .status = 400 }) catch {};
+            return null;
+        };
+    }
+    
+    pub fn validateLimit(req: *httpz.Request, default: u32, max: u32) u32 {
+        const limit_str = req.query("limit") orelse return default;
+        const limit = std.fmt.parseInt(u32, limit_str, 10) catch return default;
+        return @min(limit, max);
+    }
+};
+```
+
+### Performance Monitoring
+
+```zig
+const RequestMetrics = struct {
+    total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    error_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    
+    pub fn recordRequest(self: *RequestMetrics, is_error: bool) void {
+        _ = self.total_requests.fetchAdd(1, .monotonic);
+        if (is_error) {
+            _ = self.error_count.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+// Add metrics endpoint
+router.get("/api/v1/metrics", getMetrics, .{});
+
+fn getMetrics(_: *httpz.Request, res: *httpz.Response, app_state: AppState) !void {
+    const uptime = std.time.timestamp() - app_state.start_time;
+    const total = app_state.metrics.total_requests.load(.monotonic);
+    const errors = app_state.metrics.error_count.load(.monotonic);
+    
+    try res.json(.{
+        .uptime_seconds = uptime,
+        .total_requests = total,
+        .error_count = errors,
+        .error_rate = if (total > 0) @as(f64, @floatFromInt(errors)) / @as(f64, @floatFromInt(total)) else 0,
+    }, .{});
+}
+```
+
 ## Future Enhancements
 
-1. **WebSocket Support** - Real-time issue updates
+1. **WebSocket Support** - Real-time issue updates using httpz websocket features
 2. **Webhooks** - Notify external services of changes
-3. **Full-Text Search** - Search across issue content
+3. **Full-Text Search** - Search across issue content using SQLite FTS5
 4. **Metrics/Analytics** - Issue velocity, burndown charts
 5. **Import/Export** - Migrate from GitHub Issues, Jira, etc.
-6. **Web UI** - Browser-based interface
+6. **Web UI** - Browser-based interface served by httpz
 7. **GraphQL API** - Alternative to REST for complex queries
+8. **Rate Limiting** - Protect API from abuse
+9. **Request Caching** - Cache common queries for performance
 
 ## Example Workflows
 
@@ -427,6 +885,34 @@ done
 - CLI tool
 - Documentation site
 
+## Project Structure
+
+```
+zig-issue-tracker/
+├── build.zig
+├── build.zig.zon
+├── src/
+│   ├── main.zig           # Server entry point
+│   ├── handlers.zig       # HTTP request handlers
+│   ├── database.zig       # Database pool and connections
+│   ├── models.zig         # Data structures
+│   ├── validation.zig     # Input validation helpers
+│   └── auth.zig           # Authentication middleware
+├── docs/
+│   └── http-api-design.md # This document
+└── README.md
+```
+
 ## Conclusion
 
-The HTTP API server approach provides a flexible, scalable solution for centralized issue tracking. While it adds deployment complexity compared to embedded solutions, it enables powerful cross-project workflows and team collaboration features that justify the trade-offs for most team environments.
+The HTTP API server approach using httpz provides a flexible, scalable solution for centralized issue tracking. httpz's simple API, efficient memory management, and built-in features like JSON handling make it an excellent choice for building REST APIs in Zig. While the centralized approach adds deployment complexity compared to embedded solutions, it enables powerful cross-project workflows and team collaboration features that justify the trade-offs for most team environments.
+
+Key advantages of using httpz:
+- Native Zig implementation with zero dependencies
+- Request arena allocator for automatic memory cleanup
+- Built-in JSON serialization/deserialization
+- Simple routing with path parameters
+- Easy error handling patterns
+- Good performance characteristics
+
+This design provides a solid foundation for building a production-ready issue tracking API server in Zig.
