@@ -14,6 +14,17 @@ The server will be built using **httpz**, a lightweight and performant HTTP serv
 - Middleware and error handler support
 - Native Zig implementation with zero dependencies
 
+### Reference Implementation
+
+> **Note**: A working httpz implementation can be found in the **zig-db** project at `/home/emoessner/db/zig-db/`. Key files to examine:
+> - `src/http/server.zig` - Server wrapper pattern with configuration
+> - `src/http/app_state.zig` - Application state management
+> - `src/http/handlers.zig` - Handler patterns with httpz
+> - `src/main.zig` - Simple server initialization
+> - `build.zig` & `build.zig.zon` - Dependency configuration
+> 
+> Many patterns from this project can be directly reused for the issue tracker.
+
 ## Architecture
 
 ### Core Components
@@ -280,6 +291,11 @@ Response:
 
 ## Server Implementation
 
+> **Reference**: See `/home/emoessner/db/zig-db/src/http/` for working patterns:
+> - `server.zig` - Enhanced server wrapper with configuration
+> - `app_state.zig` - Clean AppState structure with atomic counters
+> - `handlers.zig` - Handler signatures and JSON responses
+
 ### Basic Server Setup
 
 ```zig
@@ -287,10 +303,12 @@ const std = @import("std");
 const httpz = @import("httpz");
 const database = @import("database.zig");
 
+// AppState pattern from zig-db/src/http/app_state.zig
 const AppState = struct {
     db_pool: *database.Pool,
     api_keys: std.StringHashMap(bool),
     start_time: i64,
+    request_count: std.atomic.Value(u64), // Thread-safe counter
 };
 
 pub fn main() !void {
@@ -372,6 +390,12 @@ fn errorHandler(req: *httpz.Request, res: *httpz.Response, err: anyerror, _: App
 ```
 
 ### Handler Implementation Examples
+
+> **Reference**: See `/home/emoessner/db/zig-db/src/http/handlers.zig` for simpler handler patterns including:
+> - Handler signatures (Note: zig-db uses `AppState, Request, Response` order)
+> - JSON response patterns
+> - HTML response examples
+> - Atomic counter usage
 
 ```zig
 const handlers = struct {
@@ -653,6 +677,9 @@ zig build run -- --port 8080 --db ./issues.db
 ```
 
 ### build.zig Configuration
+
+> **Reference**: See `/home/emoessner/db/zig-db/build.zig` for complete working example
+
 ```zig
 const std = @import("std");
 
@@ -660,7 +687,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     
-    // Add httpz dependency
+    // Add httpz dependency (pattern from zig-db/build.zig)
     const httpz = b.dependency("httpz", .{
         .target = target,
         .optimize = optimize,
@@ -679,7 +706,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     
-    // Add modules
+    // Add modules (exact pattern from zig-db line 101-102)
     exe.root_module.addImport("httpz", httpz.module("httpz"));
     exe.root_module.addImport("zqlite", zqlite.module("zqlite"));
     
@@ -692,18 +719,23 @@ pub fn build(b: *std.Build) void {
 ```
 
 ### build.zig.zon Dependencies
+
+> **Reference**: See `/home/emoessner/db/zig-db/build.zig.zon` for working dependencies
+
 ```zig
 .{
     .name = "zig-issue-tracker",
     .version = "0.1.0",
     .dependencies = .{
         .httpz = .{
-            .url = "https://github.com/karlseguin/http.zig/archive/[commit].tar.gz",
-            .hash = "[hash]",
+            // Exact dependency from zig-db project (tested and working)
+            .url = "git+https://github.com/karlseguin/http.zig?ref=master#2924ead41db9e1986db3b4909a82185c576f6361",
+            .hash = "httpz-0.0.0-PNVzrC7CBgDSMZNP7chgAczR3FyAz5Eum6Kb1_K9kmYR",
         },
         .zqlite = .{
-            .url = "https://github.com/karlseguin/zqlite/archive/[commit].tar.gz", 
-            .hash = "[hash]",
+            // Exact dependency from zig-db project
+            .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#fdb6ca1e379b002dd6effe22b96dc8ee93befe5e",
+            .hash = "zqlite-0.0.0-RWLaY5eAlQCBMG2E0Y8JjWkT-SZlZp39cu75CUVb2QoP",
         },
     },
 }
@@ -902,6 +934,30 @@ zig-issue-tracker/
 │   └── http-api-design.md # This document
 └── README.md
 ```
+
+## Reusable Components from zig-db
+
+The following components from the zig-db project can be directly adapted for the issue tracker:
+
+1. **Build Configuration**
+   - Copy exact httpz and zqlite dependencies from `build.zig.zon`
+   - Use the module import pattern from `build.zig`
+
+2. **Server Structure**
+   - Adapt the server wrapper pattern from `src/http/server.zig`
+   - Use the AppState pattern from `src/http/app_state.zig`
+   - Copy atomic counter implementation for thread-safe metrics
+
+3. **Handler Patterns**
+   - Study handler signatures in `src/http/handlers.zig`
+   - Note parameter ordering differences between projects
+   - Reuse JSON response helpers
+
+4. **Project Organization**
+   - Follow the `src/http/` subdirectory structure
+   - Separate concerns into focused modules
+
+The zig-db project provides a solid foundation for httpz usage that can accelerate the issue tracker implementation.
 
 ## Conclusion
 
